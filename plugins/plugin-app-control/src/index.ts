@@ -24,6 +24,7 @@ import {
 } from "./actions/views.js";
 import { createViewsClient } from "./actions/views-client.js";
 import { createChoiceShortcutEvaluator } from "./evaluators/create-choice-shortcut.js";
+import { directNavRouteEvaluator } from "./evaluators/direct-nav-route.js";
 import { viewContextEvaluator } from "./evaluators/view-context.js";
 import { availableAppsProvider } from "./providers/available-apps.js";
 import { currentViewProvider } from "./providers/current-view.js";
@@ -102,6 +103,10 @@ export {
 export type { AppControlClient } from "./client/api.js";
 export { createAppControlClient } from "./client/api.js";
 export { createChoiceShortcutEvaluator } from "./evaluators/create-choice-shortcut.js";
+export {
+	directNavRouteEvaluator,
+	resolveDirectNavCommandView,
+} from "./evaluators/direct-nav-route.js";
 export { viewCommandShortcutEvaluator } from "./evaluators/view-command-shortcut.js";
 export {
 	CONTEXT_VIEWS,
@@ -169,8 +174,16 @@ export const appControlPlugin: Plugin = {
 	//     rules it falls back to), so it never contends with the action.
 	evaluators: [viewContextEvaluator],
 	// Persisted choice widgets are an explicit continuation protocol. Ordinary
-	// view navigation and follow-up language stays with Stage 1 and the planner.
-	responseHandlerEvaluators: [createChoiceShortcutEvaluator],
+	// view navigation and follow-up language stays with Stage 1 and the planner
+	// — EXCEPT the closed-set direct-channel command form ("go home", "open
+	// settings" as the whole message on a DM/self/API surface), which
+	// directNavRouteEvaluator routes deterministically to VIEWS so a pure
+	// navigation tap never pays tool retrieval + the planner loop (live trace
+	// 847787e3b15c467da3ef0d004aa31085: 10.6s for "go home").
+	responseHandlerEvaluators: [
+		directNavRouteEvaluator,
+		createChoiceShortcutEvaluator,
+	],
 	providers: [availableAppsProvider, currentViewProvider],
 	services: [
 		AppRegistryService,

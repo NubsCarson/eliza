@@ -512,6 +512,51 @@ describe("runShortcutGate (#8791 pre-LLM gate)", () => {
 		]);
 	});
 
+	it("announces the shortcut's tool call on the streaming hook before execution (SSE running_tool parity)", async () => {
+		const order: string[] = [];
+		const { runtime } = makeRuntime({
+			actions: [
+				echoAction({
+					onOptions: () => {
+						order.push("handler");
+					},
+				}),
+			],
+		});
+		const onToolCall = vi.fn((_payload: unknown) => {
+			order.push("onToolCall");
+		});
+
+		const result = await runWithStreamingContext(
+			{
+				messageId: "00000000-0000-0000-0000-0000000000f2" as UUID,
+				onToolCall,
+			} as never,
+			() =>
+				runShortcutGate({
+					// biome-ignore lint/suspicious/noExplicitAny: minimal fake runtime
+					runtime: runtime as any,
+					message: msg("/echo hi"),
+					state: {} as State,
+					responseId,
+					senderRole: "OWNER",
+				}),
+		);
+
+		expect(result?.kind).toBe("direct_reply");
+		// The running_tool announcement precedes execution so the chat SSE
+		// surface shows activity while the action runs, not only its result.
+		expect(order).toEqual(["onToolCall", "handler"]);
+		expect(onToolCall).toHaveBeenCalledTimes(1);
+		expect(onToolCall.mock.calls[0]?.[0]).toMatchObject({
+			toolCall: {
+				name: "ECHO_COMMAND",
+				status: "pending",
+			},
+			metadata: { deterministic: true },
+		});
+	});
+
 	it("allows an OWNER to trigger the same OWNER-gated shortcut action", async () => {
 		const handler = vi.fn(
 			async (
