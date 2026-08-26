@@ -6,7 +6,7 @@
 
 import type { ResponseHandlerEvaluatorContext } from "@elizaos/core";
 import { ChannelType } from "@elizaos/core";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
 	directNavRouteEvaluator,
 	resolveDirectNavCommandView,
@@ -143,6 +143,22 @@ describe("directNavRouteEvaluator — deterministic VIEWS route on direct channe
 		expect(
 			await run("go home", { channelType: ChannelType.DM, hasViews: false }),
 		).toBeNull();
+	});
+
+	it("warns once (per process) when a nav command matches during the missing-VIEWS boot window", async () => {
+		const warn = vi.fn();
+		const c = ctx("go home", {
+			channelType: ChannelType.DM,
+			hasViews: false,
+		});
+		(c.runtime as { logger?: { warn: typeof warn } }).logger = { warn };
+		expect(await directNavRouteEvaluator.shouldRun(c)).toBe(false);
+		// One-shot: earlier suite runs may already have consumed the warning
+		// (module-level latch); this pins "at most once", never per-message spam.
+		const callsAfterFirst = warn.mock.calls.length;
+		expect(callsAfterFirst).toBeLessThanOrEqual(1);
+		expect(await directNavRouteEvaluator.shouldRun(c)).toBe(false);
+		expect(warn.mock.calls.length).toBe(callsAfterFirst);
 	});
 });
 

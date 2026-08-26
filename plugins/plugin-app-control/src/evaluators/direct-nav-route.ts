@@ -84,12 +84,32 @@ function isDirectNavChannel(message: Memory | undefined): boolean {
 	);
 }
 
+/**
+ * One-shot boot-window diagnostic: during startup a nav command can arrive on a
+ * direct channel before the VIEWS action registers, and the gate silently falls
+ * back to the planner. Logged once per process so the boot window is visible in
+ * logs without spamming every group-chat "go home".
+ */
+let warnedViewsActionMissing = false;
+
 function resolveRoute(context: ResponseHandlerEvaluatorContext): string | null {
 	if (!isDirectNavChannel(context.message)) return null;
 	const hasViewsAction = (context.runtime.actions ?? []).some(
 		(action) => action.name?.toUpperCase() === VIEWS_ACTION_NAME,
 	);
-	if (!hasViewsAction) return null;
+	if (!hasViewsAction) {
+		if (
+			!warnedViewsActionMissing &&
+			resolveDirectNavCommandView(userRequestMessageText(context.message))
+		) {
+			warnedViewsActionMissing = true;
+			context.runtime.logger?.warn(
+				{ src: "app-control", evaluator: "app-control.direct-nav-route" },
+				"[app-control] direct-nav command matched but the VIEWS action is not registered yet (boot window?); falling back to the planner",
+			);
+		}
+		return null;
+	}
 	// Security-unwrapped user words — envelope warning text never feeds the
 	// navigation matcher (same contract as view-command-routing).
 	return resolveDirectNavCommandView(userRequestMessageText(context.message));

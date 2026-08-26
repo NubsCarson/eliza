@@ -45,6 +45,7 @@ function captureDescriptor(
       input.callerSeed ?? "readiness-caller",
     ) as UUID,
     callerRole: input.callerRole ?? "USER",
+    callerGrantSource: "connector_admin",
     callerUserName: input.callerSeed ?? "readiness-caller",
   });
 }
