@@ -1437,6 +1437,114 @@ describe("v5 happy path — message handler → planner → executor → evaluat
 		).toMatchObject({ tool: { name: "VIEWS", success: true } });
 	});
 
+	// tj-a835d4c6da235f: a deterministic VIEWS navigation succeeded with an
+	// internal-visibility JSON effect receipt and the turn still closed with
+	// the no-result apology. The answerless floor must synthesize the honest
+	// confirmation from the accepted effect's label — no model call.
+	const runDeterministicViewsTurn = async (
+		handlerResult: ActionResult,
+	): Promise<string | undefined> => {
+		const views = makeMockAction({
+			name: "VIEWS",
+			parameters: [
+				{
+					name: "action",
+					description: "View operation",
+					required: true,
+					schema: { type: "string" },
+				},
+				{
+					name: "view",
+					description: "Registered view id",
+					required: true,
+					schema: { type: "string" },
+				},
+			],
+			suppressEarlyReply: true,
+			suppressPostActionContinuation: true,
+			handler: async () => handlerResult,
+		});
+		const deterministicViewEvaluator = {
+			name: "test.force_deterministic_view_effect",
+			priority: 10,
+			deterministicActions: ["VIEWS"],
+			shouldRun: () => true,
+			evaluate: () => ({
+				requiresTool: true,
+				clearReply: true,
+				deterministicToolCall: {
+					name: "VIEWS",
+					params: { action: "show", view: "chat" },
+				},
+			}),
+		} satisfies import("../runtime/response-handler-evaluators").ResponseHandlerEvaluator;
+		const runtime = makeRuntime({
+			actions: [views],
+			responseHandlerEvaluators: [deterministicViewEvaluator],
+			responses: [
+				{
+					expectModelType: ModelType.RESPONSE_HANDLER,
+					body: stage1Response({
+						contexts: ["general"],
+						candidateActionNames: ["VIEWS"],
+						replyText: "Heading there now.",
+						thought: "The view switch is deterministic.",
+					}),
+				},
+			],
+		});
+		const result = await runV5MessageRuntimeStage1({
+			runtime,
+			message: makeMessage("go home"),
+			state: makeState(),
+			responseId: RESPONSE_ID,
+		});
+		expect(result.kind).toBe("planned_reply");
+		expect(getCalls(runtime).map((call) => call.modelType)).toEqual([
+			ModelType.RESPONSE_HANDLER,
+		]);
+		return result.kind === "planned_reply"
+			? result.result.responseContent?.text
+			: undefined;
+	};
+
+	it("confirms a deterministic VIEWS success from its accepted effect receipt instead of the no-result apology", async () => {
+		const text = await runDeterministicViewsTurn({
+			success: true,
+			text: JSON.stringify({
+				effect: "view_navigation",
+				status: "accepted",
+				viewId: "chat",
+				label: "Home",
+				path: "/",
+			}),
+			transcriptVisibility: "internal",
+			modelReplyRequired: true,
+		});
+		expect(text).toBe("done — you're on Home.");
+	});
+
+	it("keeps the effect confirmation through reply egress when the view label collides with a tracked-work noun", async () => {
+		const text = await runDeterministicViewsTurn({
+			success: true,
+			text: JSON.stringify({
+				effect: "view_navigation",
+				status: "accepted",
+				viewId: "settings",
+				label: "Settings",
+				path: "/settings",
+			}),
+			transcriptVisibility: "internal",
+			modelReplyRequired: true,
+		});
+		expect(text).toBe("done — you're on Settings.");
+	});
+
+	it("keeps the no-result fallback for a deterministic success with no receipt at all", async () => {
+		const text = await runDeterministicViewsTurn({ success: true });
+		expect(text).toBe(NO_REPORTABLE_TOOL_OUTCOME_MESSAGE);
+	});
+
 	it("announces a deterministic tool call on the streaming hook before the handler runs (SSE running_tool parity)", async () => {
 		const order: string[] = [];
 		const views = makeMockAction({
