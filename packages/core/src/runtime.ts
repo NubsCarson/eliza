@@ -1270,6 +1270,25 @@ export class AgentRuntime implements IAgentRuntime {
 		Memory,
 		{ text: unknown; state: State }
 	>();
+	// Same-turn cache for owner-exclusive provider results, which the
+	// message-keyed caches above deliberately refuse to hold. Keyed by the
+	// exact inbound Memory object so entries cannot outlive the turn or cross
+	// messages, and stamped with the message text plus the trusted-delivery
+	// audience key so a rewritten turn or any audience change forces a fresh
+	// run. This is what lets the planner recompose (refreshProviders !== null)
+	// reuse a sensitive provider instead of re-running it (observed live:
+	// firstRun re-ran at 1.5s on the recompose pass, trace 847787e3b15c…):
+	// the disclosure gate is still authorized on every pass, the end-of-compose
+	// revalidation still runs, and the results still never enter stateCache or
+	// the public projection.
+	private readonly sensitiveProviderResultsByMessage = new WeakMap<
+		Memory,
+		{
+			text: unknown;
+			audienceKey: string;
+			providers: Record<string, CachedProviderResult>;
+		}
+	>();
 	private providerExecutionsInFlight = new Map<
 		string,
 		InFlightProviderExecution
@@ -5012,13 +5031,32 @@ export class AgentRuntime implements IAgentRuntime {
 					),
 				)
 			: null;
+		// Owner-exclusive results are reusable ONLY within the same turn: same
+		// Memory object, unchanged message text, identical delivery-audience
+		// key, and a refresh-style recompose that did not name the provider.
+		// Every included sensitive provider still passes the per-pass
+		// disclosure authorization above, so a denied provider can never be
+		// resurrected from this cache.
+		const sensitiveCacheEntry = skipCache
+			? undefined
+			: this.sensitiveProviderResultsByMessage.get(message);
+		const reusableSensitiveResults =
+			refreshSet !== null &&
+			sensitiveCacheEntry !== undefined &&
+			sensitiveCacheEntry.text === message.content.text &&
+			sensitiveCacheEntry.audienceKey === audienceCacheKey
+				? sensitiveCacheEntry.providers
+				: null;
 		const providersToRun = refreshSet
-			? providersToGet.filter(
-					(p) =>
-						p.disclosureGate?.require === "owner_exclusive" ||
-						refreshSet.has(p.name) ||
-						!cachedProviderNames?.has(p.name),
-				)
+			? providersToGet.filter((p) => {
+					if (p.disclosureGate?.require === "owner_exclusive") {
+						return (
+							refreshSet.has(p.name) ||
+							reusableSensitiveResults?.[p.name] === undefined
+						);
+					}
+					return refreshSet.has(p.name) || !cachedProviderNames?.has(p.name);
+				})
 			: providersToGet;
 		const providersToRunNames = new Set(providersToRun.map((p) => p.name));
 		const reusedProviders = providersToGet.filter(
@@ -5220,11 +5258,12 @@ export class AgentRuntime implements IAgentRuntime {
 			(record) => record.providerError !== undefined,
 		);
 		for (const provider of reusedProviders) {
-			const cached = (
-				cachedState.data.providers as
-					| Record<string, CachedProviderResult>
-					| undefined
-			)?.[provider.name];
+			const cached =
+				(
+					cachedState.data.providers as
+						| Record<string, CachedProviderResult>
+						| undefined
+				)?.[provider.name] ?? reusableSensitiveResults?.[provider.name];
 			recordInferenceSpan(`provider-cache:${provider.name}`, 0, {
 				cacheHit: true,
 				...(typeof cached?.providerDurationMs === "number"
@@ -5249,6 +5288,19 @@ export class AgentRuntime implements IAgentRuntime {
 				deniedSensitiveProviderNames.has(provider.name)
 			) {
 				delete currentProviderResults[provider.name];
+			}
+		}
+		// Re-admit same-turn sensitive results for the providers this pass
+		// REUSED (they sit in reusedProviders, so they were authorized above and
+		// excluded from providersToRun). Fresh sensitive runs land through the
+		// providerData merge below like any other provider.
+		if (reusableSensitiveResults) {
+			for (const provider of reusedProviders) {
+				if (provider.disclosureGate?.require !== "owner_exclusive") continue;
+				const cached = reusableSensitiveResults[provider.name];
+				if (cached) {
+					currentProviderResults[provider.name] = cached;
+				}
 			}
 		}
 		for (const freshResult of providerData) {
@@ -5584,6 +5636,23 @@ export class AgentRuntime implements IAgentRuntime {
 					},
 					text: publicText,
 				},
+			});
+			// Retain this pass's authorized owner-exclusive results for same-turn
+			// reuse (see sensitiveProviderResultsByMessage). Guarded by the same
+			// abort recheck as the public projection above, and stamped with the
+			// text + audience key that the reuse path re-verifies.
+			const sensitiveResults: Record<string, CachedProviderResult> = {};
+			for (const provider of providersToGet) {
+				if (provider.disclosureGate?.require !== "owner_exclusive") continue;
+				const result = currentProviderResults[provider.name];
+				if (result) {
+					sensitiveResults[provider.name] = result;
+				}
+			}
+			this.sensitiveProviderResultsByMessage.set(message, {
+				text: message.content.text,
+				audienceKey: audienceCacheKey,
+				providers: sensitiveResults,
 			});
 		}
 		return newState;

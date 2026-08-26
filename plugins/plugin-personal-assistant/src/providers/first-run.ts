@@ -128,9 +128,12 @@ export const firstRunProvider: Provider = {
     message: Memory,
     _state: State,
   ): Promise<ProviderResult> {
-    if (!(await hasOwnerAccess(runtime, message))) {
-      return QUIET_RESULT;
-    }
+    // Read the lifecycle record BEFORE the owner-access check: on a completed
+    // install (the steady state) the provider goes quiet on one cache read
+    // instead of paying the multi-query role resolution every compose pass.
+    // The record is agent-scoped lifecycle state with no per-user data, so
+    // reading it ahead of the sender gate discloses nothing; the owner gate
+    // still guards every surfaced affordance below.
     let store: ReturnType<typeof createFirstRunStateStore>;
     try {
       store = createFirstRunStateStore(runtime);
@@ -151,6 +154,10 @@ export const firstRunProvider: Provider = {
     }
 
     if (record.status === "complete") {
+      return QUIET_RESULT;
+    }
+
+    if (!(await hasOwnerAccess(runtime, message))) {
       return QUIET_RESULT;
     }
 

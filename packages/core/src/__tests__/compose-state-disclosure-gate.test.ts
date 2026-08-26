@@ -104,7 +104,7 @@ describe("composeState owner-exclusive providers", () => {
 		expect(second.text).toContain("audience_changed");
 	});
 
-	it("reuses public providers while revalidating private providers in one turn", async () => {
+	it("reuses public AND private providers across a same-turn refresh recompose", async () => {
 		const { runtime } = runtimeHarness();
 		const publicGet = vi.fn(async () => ({ text: "PUBLIC_PROVIDER_CANARY" }));
 		const privateGet = vi.fn(async () => ({ text: "PRIVATE_PROVIDER_CANARY" }));
@@ -140,8 +140,95 @@ describe("composeState owner-exclusive providers", () => {
 		expect(second.text).toContain("PUBLIC_PROVIDER_CANARY");
 		expect(second.text).toContain("PRIVATE_PROVIDER_CANARY");
 		expect(publicGet).toHaveBeenCalledTimes(1);
-		expect(privateGet).toHaveBeenCalledTimes(2);
+		// Same Memory object, unchanged text, identical audience key, and a
+		// refresh-style recompose that did not name the provider: the sensitive
+		// result is reused from the same-turn cache instead of re-running
+		// (observed live: firstRun re-ran at 1.5s on the planner recompose).
+		// The mixed state still never enters stateCache.
+		expect(privateGet).toHaveBeenCalledTimes(1);
 		expect(runtime.stateCache.has(turn.id as string)).toBe(false);
+	});
+
+	it("re-runs a sensitive provider when the refresh recompose names it", async () => {
+		const { runtime } = runtimeHarness();
+		const privateGet = vi.fn(async () => ({ text: "PRIVATE_PROVIDER_CANARY" }));
+		runtime.registerProvider({
+			name: "PRIVATE",
+			disclosureGate: { require: "owner_exclusive" },
+			get: privateGet,
+		});
+		const turn = message(
+			runtime,
+			"99999999-9999-9999-9999-999999999999" as UUID,
+		);
+		await attestDeliveryAudienceFromCanonicalRoom(runtime, turn);
+
+		await runtime.composeState(turn, ["PRIVATE"], true, false, []);
+		await runtime.composeState(turn, ["PRIVATE"], true, false, ["PRIVATE"]);
+
+		expect(privateGet).toHaveBeenCalledTimes(2);
+	});
+
+	it("never reuses a sensitive result after the delivery audience changes", async () => {
+		const { runtime, setParticipants } = runtimeHarness();
+		const privateGet = vi.fn(async () => ({ text: "PRIVATE_PROVIDER_CANARY" }));
+		runtime.registerProvider({
+			name: "PRIVATE",
+			disclosureGate: { require: "owner_exclusive" },
+			get: privateGet,
+		});
+		const turn = message(
+			runtime,
+			"aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa" as UUID,
+		);
+		await attestDeliveryAudienceFromCanonicalRoom(runtime, turn);
+
+		const first = await runtime.composeState(
+			turn,
+			["PRIVATE"],
+			true,
+			false,
+			[],
+		);
+		expect(first.text).toContain("PRIVATE_PROVIDER_CANARY");
+		expect(privateGet).toHaveBeenCalledTimes(1);
+
+		setParticipants([OWNER, runtime.agentId, GUEST]);
+		const second = await runtime.composeState(
+			turn,
+			["PRIVATE"],
+			true,
+			false,
+			[],
+		);
+
+		// The disclosure gate denies the widened audience, and the same-turn
+		// sensitive cache (stamped with the old audience key) never resurrects
+		// the private text.
+		expect(privateGet).toHaveBeenCalledTimes(1);
+		expect(second.text).not.toContain("PRIVATE_PROVIDER_CANARY");
+		expect(second.text).toContain("Owner-private access notice");
+	});
+
+	it("never reuses a sensitive result after the message text is rewritten", async () => {
+		const { runtime } = runtimeHarness();
+		const privateGet = vi.fn(async () => ({ text: "PRIVATE_PROVIDER_CANARY" }));
+		runtime.registerProvider({
+			name: "PRIVATE",
+			disclosureGate: { require: "owner_exclusive" },
+			get: privateGet,
+		});
+		const turn = message(
+			runtime,
+			"bbbbbbbb-1111-4111-8111-bbbbbbbbbbbb" as UUID,
+		);
+		await attestDeliveryAudienceFromCanonicalRoom(runtime, turn);
+
+		await runtime.composeState(turn, ["PRIVATE"], true, false, []);
+		turn.content.text = "rewritten private context";
+		await runtime.composeState(turn, ["PRIVATE"], true, false, []);
+
+		expect(privateGet).toHaveBeenCalledTimes(2);
 	});
 
 	it("invalidates the public-only turn cache when message text changes", async () => {
