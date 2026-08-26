@@ -13,6 +13,7 @@ import crypto from "node:crypto";
 import type http from "node:http";
 import { loadElizaConfig } from "@elizaos/agent";
 import { logger } from "@elizaos/core";
+import { resolveRateLimitClientKey } from "@elizaos/shared";
 import { readAliasedEnv } from "@elizaos/shared/utils/env";
 import { AuthStore } from "../services/auth-store";
 import {
@@ -157,6 +158,18 @@ function rateLimitPairing(ip: string | null): boolean {
 
   current.count += 1;
   return true;
+}
+
+/** Whole seconds until the key's pairing window resets (`Retry-After`). */
+function pairingRetryAfterSeconds(
+  ip: string | null,
+  now: number = Date.now(),
+): number {
+  const entry = pairingAttempts.get(ip ?? "unknown");
+  if (!entry || now > entry.resetAt) {
+    return Math.ceil(PAIRING_WINDOW_MS / 1000);
+  }
+  return Math.max(1, Math.ceil((entry.resetAt - now) / 1000));
 }
 
 // ---------------------------------------------------------------------------
@@ -346,8 +359,20 @@ export async function handleAuthPairingCompatRoutes(
       return true;
     }
 
+    // Ordering: the code is compared FIRST, so a correct code is never
+    // throttled by the failed-attempt bucket — only mismatches consume it.
+    // The bucket is keyed on the real client behind a trusted proxy
+    // (`resolveRateLimitClientKey`, keying only — never trust), so one noisy
+    // client cannot exhaust pairing for everyone sharing the proxy address.
     if (!tokenMatches(normalizePairingCode(current), provided)) {
-      if (!rateLimitPairing(remoteAddress)) {
+      const limiterKey = resolveRateLimitClientKey(req) ?? remoteAddress;
+      if (!rateLimitPairing(limiterKey)) {
+        if (!res.headersSent) {
+          res.setHeader(
+            "retry-after",
+            String(pairingRetryAfterSeconds(limiterKey)),
+          );
+        }
         sendJsonErrorResponse(res, 429, "Too many attempts. Try again later.");
         return true;
       }

@@ -1333,6 +1333,7 @@ import {
   normalizePairingCode as _normalizePairingCode,
   normalizeWsClientId as _normalizeWsClientId,
   pairingEnabled as _pairingEnabled,
+  pairingRetryAfterSeconds as _pairingRetryAfterSeconds,
   rateLimitPairing as _rateLimitPairing,
   rejectWebSocketUpgrade as _rejectWebSocketUpgrade,
   releasePendingWebSocket as _releasePendingWebSocket,
@@ -1398,6 +1399,7 @@ const pairingEnabled = _pairingEnabled;
 const ensurePairingCode = _ensurePairingCode;
 const normalizePairingCode = _normalizePairingCode;
 const rateLimitPairing = _rateLimitPairing;
+const pairingRetryAfterSeconds = _pairingRetryAfterSeconds;
 const getPairingExpiresAt = _getPairingExpiresAt;
 const clearPairing = _clearPairing;
 
@@ -2127,6 +2129,7 @@ async function handleRequest(
       ensurePairingCode,
       normalizePairingCode,
       rateLimitPairing,
+      pairingRetryAfterSeconds,
       getPairingExpiresAt,
       clearPairing,
     })

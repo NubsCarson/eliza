@@ -55,6 +55,16 @@ class SensitiveRateLimiter {
     return true;
   }
 
+  /**
+   * Whole seconds until the key's window resets — the `Retry-After` value a
+   * 429 response should carry. Returns 1 when the key has no live window.
+   */
+  retryAfterSeconds(ip: string | null, now: number = Date.now()): number {
+    const entry = this.buckets.get(ip ?? "unknown");
+    if (!entry || now >= entry.resetAt) return 1;
+    return Math.max(1, Math.ceil((entry.resetAt - now) / 1000));
+  }
+
   reset(): void {
     this.buckets.clear();
   }

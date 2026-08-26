@@ -7,7 +7,7 @@
 
 import type http from "node:http";
 import { type RoleGateRole, roleRank } from "@elizaos/core";
-import { resolveApiToken } from "@elizaos/shared";
+import { resolveApiToken, resolveRateLimitClientKey } from "@elizaos/shared";
 // AuthStore is statically imported elsewhere in the package; the dynamic
 // import below was INEFFECTIVE_DYNAMIC_IMPORT.
 import { type AuthIdentityRow, AuthStore } from "../services/auth-store.js";
@@ -94,8 +94,26 @@ export function embedBoundaryRole(
 }
 
 // ── Auth attempt rate limiter ─────────────────────────────────────────────────
+//
+// Counts FAILED auth attempts only (20/min per client key). Two architecture
+// rules keep it fail-safe behind a local reverse proxy (Traefik/nginx), where
+// every remote client used to share the proxy's single socket-address bucket
+// and unauthenticated noise 429'd valid paired-device requests:
+//
+//  1. ORDERING — credentials are validated BEFORE the limiter may deny, and a
+//     successful validation never consumes the bucket. Only a genuinely failed
+//     attempt increments it, and only a failed attempt can be answered 429.
+//     The residual cost of validating a failing credential while the bucket is
+//     exhausted is one timing-safe compare / indexed session lookup, which is
+//     the accepted trade for never throttling valid credentials.
+//  2. KEYING — buckets are keyed on the real client behind a trusted proxy
+//     via `resolveRateLimitClientKey` (rightmost X-Forwarded-For entry
+//     appended by a loopback or ELIZA_TRUSTED_PROXY_ADDRS peer; see the
+//     spoofing analysis there). Without a trusted proxy in front, the key is
+//     the socket address — byte-identical to the previous behavior. The key
+//     is NEVER used for trust decisions, only bucket partitioning.
 const AUTH_RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minute
-const AUTH_RATE_LIMIT_MAX = 20; // max failed attempts per window per IP
+const AUTH_RATE_LIMIT_MAX = 20; // max failed attempts per window per client key
 const authAttempts = new Map<string, { count: number; resetAt: number }>();
 
 /** Clear all auth rate limit state. Exported for test use only. */
@@ -114,6 +132,13 @@ const authSweepTimer = setInterval(
 );
 if (typeof authSweepTimer === "object" && "unref" in authSweepTimer) {
   authSweepTimer.unref();
+}
+
+/** Proxy-aware bucket key for this request (see keying note above). */
+function authRateLimitKey(
+  req: Pick<http.IncomingMessage, "headers" | "socket">,
+): string | null {
+  return resolveRateLimitClientKey(req);
 }
 
 function isAuthRateLimited(ip: string | null): boolean {
@@ -138,6 +163,51 @@ function recordFailedAuth(ip: string | null): void {
   }
 }
 
+/** Whole seconds until the key's window resets — the `Retry-After` value. */
+function authRetryAfterSeconds(
+  ip: string | null,
+  now: number = Date.now(),
+): number {
+  const entry = authAttempts.get(ip ?? "unknown");
+  if (!entry || now > entry.resetAt) {
+    return Math.ceil(AUTH_RATE_LIMIT_WINDOW_MS / 1000);
+  }
+  return Math.max(1, Math.ceil((entry.resetAt - now) / 1000));
+}
+
+/**
+ * Deny a FAILED auth attempt: consume the bucket, then answer 429 (with a
+ * client-friendly `retryAfterSeconds`) once the key's window is exhausted,
+ * 401 otherwise. Never called on a successful validation, so valid
+ * credentials neither consume the bucket nor see its 429.
+ */
+function denyFailedAuth(
+  ip: string | null,
+): Extract<RouteRoleResolution, { ok: false }> {
+  const alreadyLimited = isAuthRateLimited(ip);
+  recordFailedAuth(ip);
+  if (alreadyLimited) {
+    return {
+      ok: false,
+      status: 429,
+      reason: "Too many authentication attempts",
+      retryAfterSeconds: authRetryAfterSeconds(ip),
+    };
+  }
+  return { ok: false, status: 401, reason: "Unauthorized" };
+}
+
+/** Apply a denial to the HTTP response, including `Retry-After` on 429s. */
+function sendResolutionError(
+  res: http.ServerResponse,
+  resolved: Extract<RouteRoleResolution, { ok: false }>,
+): void {
+  if (resolved.retryAfterSeconds !== undefined && !res.headersSent) {
+    res.setHeader("retry-after", String(resolved.retryAfterSeconds));
+  }
+  sendJsonError(res, resolved.status, resolved.reason);
+}
+
 /**
  * Gate a request behind the configured API token (sync, bearer-only).
  *
@@ -159,17 +229,12 @@ export function ensureCompatApiAuthorized(
     return false;
   }
 
-  const ip = req.socket.remoteAddress ?? null;
-  if (isAuthRateLimited(ip)) {
-    sendJsonError(res, 429, "Too many authentication attempts");
-    return false;
-  }
-
+  // Validate BEFORE the failed-auth limiter may deny: a correct bearer is
+  // never throttled by other clients' noise and never consumes the bucket.
   const providedToken = getProvidedApiToken(req);
   if (providedToken && tokenMatches(expectedToken, providedToken)) return true;
 
-  recordFailedAuth(ip);
-  sendJsonError(res, 401, "Unauthorized");
+  sendResolutionError(res, denyFailedAuth(authRateLimitKey(req)));
   return false;
 }
 
@@ -215,7 +280,7 @@ export async function ensureCompatApiAuthorizedAsync(
     skipCsrf: options.skipCsrf,
   });
   if (!resolved.ok) {
-    sendJsonError(res, resolved.status, resolved.reason);
+    sendResolutionError(res, resolved);
     return false;
   }
   return true;
@@ -284,7 +349,13 @@ export function readCookie(
 export type AuthSessionOrBootstrapResult =
   | { kind: "session"; sessionId: string }
   | { kind: "bootstrap"; token: string; bearer: string }
-  | { kind: "denied"; status: 401 | 403 | 429; reason: string };
+  | {
+      kind: "denied";
+      status: 401 | 403 | 429;
+      reason: string;
+      /** Present on 429s: whole seconds for the `Retry-After` header. */
+      retryAfterSeconds?: number;
+    };
 
 /**
  * Decide whether a request carries a valid session cookie or a bootstrap
@@ -300,11 +371,11 @@ export type AuthSessionOrBootstrapResult =
 export function ensureAuthSessionOrBootstrap(
   req: Pick<http.IncomingMessage, "headers" | "socket">,
 ): AuthSessionOrBootstrapResult {
-  const ip = req.socket.remoteAddress ?? null;
-  if (isAuthRateLimited(ip)) {
-    return { kind: "denied", status: 429, reason: "rate_limited" };
-  }
-
+  // Requests presenting a credential pass through for downstream validation
+  // (cookie → the route's `AuthStore.findSession` lookup; bearer → the
+  // audited, separately rate-limited bootstrap-exchange route). The
+  // failed-auth bucket therefore only gates credential-less requests and can
+  // never 429 a caller whose auth would succeed.
   const cookie = readCookie(req, SESSION_COOKIE_NAME);
   if (cookie) {
     // Caller is expected to look up the session by id and confirm it is
@@ -318,7 +389,15 @@ export function ensureAuthSessionOrBootstrap(
     return { kind: "bootstrap", token: bearer, bearer };
   }
 
-  recordFailedAuth(ip);
+  const denied = denyFailedAuth(authRateLimitKey(req));
+  if (denied.status === 429) {
+    return {
+      kind: "denied",
+      status: 429,
+      reason: "rate_limited",
+      retryAfterSeconds: denied.retryAfterSeconds,
+    };
+  }
   return { kind: "denied", status: 401, reason: "auth_required" };
 }
 
@@ -396,7 +475,13 @@ export type RouteRoleResolution =
       identityId?: string;
       principal?: string;
     }
-  | { ok: false; status: 401 | 403 | 429; reason: string };
+  | {
+      ok: false;
+      status: 401 | 403 | 429;
+      reason: string;
+      /** Present on 429s: whole seconds for the `Retry-After` header. */
+      retryAfterSeconds?: number;
+    };
 
 type AuthorizedRouteRoleOptions =
   | {
@@ -491,14 +576,11 @@ export async function resolveAuthorizedRouteRole(
   req: Pick<http.IncomingMessage, "headers" | "socket" | "method">,
   options: AuthorizedRouteRoleOptions,
 ): Promise<RouteRoleResolution> {
-  const ip = req.socket.remoteAddress ?? null;
-  if (isAuthRateLimited(ip)) {
-    return {
-      ok: false,
-      status: 429,
-      reason: "Too many authentication attempts",
-    };
-  }
+  // No upfront limiter denial: every credential path below is validated
+  // first, and only attempts that FAIL reach `denyFailedAuth`, so an
+  // exhausted bucket (e.g. scanner noise sharing a proxy) can never 429 a
+  // request whose session/token is valid.
+  const ip = authRateLimitKey(req);
 
   if (isTrustedLocalRequest(req)) return { ok: true, role: "OWNER" };
 
@@ -514,8 +596,7 @@ export async function resolveAuthorizedRouteRole(
   if (!store) {
     const expectedToken = getCompatApiToken();
     if (!expectedToken) {
-      recordFailedAuth(ip);
-      return { ok: false, status: 401, reason: "Unauthorized" };
+      return denyFailedAuth(ip);
     }
 
     const providedToken = getProvidedApiToken(req);
@@ -523,8 +604,7 @@ export async function resolveAuthorizedRouteRole(
       return { ok: true, role: "OWNER" };
     }
 
-    recordFailedAuth(ip);
-    return { ok: false, status: 401, reason: "Unauthorized" };
+    return denyFailedAuth(ip);
   }
 
   const method = (req.method ?? "GET").toUpperCase();
@@ -596,8 +676,7 @@ export async function resolveAuthorizedRouteRole(
     }
   }
 
-  recordFailedAuth(ip);
-  return { ok: false, status: 401, reason: "Unauthorized" };
+  return denyFailedAuth(ip);
 }
 
 /**
@@ -617,7 +696,7 @@ export async function ensureRouteMinRole(
 ): Promise<boolean> {
   const resolved = await resolveAuthorizedRouteRole(req, { ...options, state });
   if (!resolved.ok) {
-    sendJsonError(res, resolved.status, resolved.reason);
+    sendResolutionError(res, resolved);
     return false;
   }
 

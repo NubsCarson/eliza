@@ -570,6 +570,18 @@ export function rateLimitPairing(ip: string | null): boolean {
   return true;
 }
 
+/** Whole seconds until the key's pairing window resets (`Retry-After`). */
+export function pairingRetryAfterSeconds(
+  ip: string | null,
+  now: number = Date.now(),
+): number {
+  const entry = pairingAttempts.get(ip ?? "unknown");
+  if (!entry || now > entry.resetAt) {
+    return Math.ceil(PAIRING_WINDOW_MS / 1000);
+  }
+  return Math.max(1, Math.ceil((entry.resetAt - now) / 1000));
+}
+
 export function getPairingExpiresAt(): number {
   return pairingExpiresAt;
 }

@@ -19,6 +19,7 @@
 
 import crypto from "node:crypto";
 import type http from "node:http";
+import { resolveRateLimitClientKey } from "@elizaos/shared";
 import { AuthStore, type DrizzleDatabase } from "../services/auth-store";
 import {
   appendAuditEvent,
@@ -72,6 +73,14 @@ function isValidDisplayName(value: unknown): value is string {
 }
 
 // ── In-process rate limiting (auth bucket — same 20/min as auth.ts) ─────────
+//
+// Keyed on the proxy-aware client key from `resolveRateLimitClientKey` (see
+// the keying + spoofing analysis in `@elizaos/shared` loopback-trust): behind
+// a trusted local proxy, one noisy client must not exhaust the bucket for
+// every other client sharing the proxy's socket address. Login follows the
+// failed-attempts-only contract from `auth.ts` — the limiter is checked
+// BEFORE the (deliberately expensive) password verification, but only FAILED
+// logins consume the bucket, so successful logins never fill the window.
 
 interface AuthAttempt {
   count: number;
@@ -82,10 +91,19 @@ const AUTH_ATTEMPT_MAX = 20;
 const sessionRouteAttempts = new Map<string, AuthAttempt>();
 const passwordChangeLimiter = getSensitiveLimiter("auth.password.change");
 
-function consumeAuthBucket(
+function isAuthBucketLimited(
   ip: string | null,
   now: number = Date.now(),
 ): boolean {
+  const entry = sessionRouteAttempts.get(ip ?? "unknown");
+  if (!entry || now > entry.resetAt) return false;
+  return entry.count >= AUTH_ATTEMPT_MAX;
+}
+
+function recordAuthBucketFailure(
+  ip: string | null,
+  now: number = Date.now(),
+): void {
   const key = ip ?? "unknown";
   const entry = sessionRouteAttempts.get(key);
   if (!entry || now > entry.resetAt) {
@@ -93,10 +111,42 @@ function consumeAuthBucket(
       count: 1,
       resetAt: now + AUTH_ATTEMPT_WINDOW_MS,
     });
-    return true;
+  } else {
+    entry.count += 1;
   }
-  if (entry.count >= AUTH_ATTEMPT_MAX) return false;
-  entry.count += 1;
+}
+
+/** Setup keeps consume-per-attempt semantics: there is no credential whose
+ * success could exempt it, and the shared window still bounds write floods. */
+function consumeAuthBucket(
+  ip: string | null,
+  now: number = Date.now(),
+): boolean {
+  if (isAuthBucketLimited(ip, now)) return false;
+  recordAuthBucketFailure(ip, now);
+  return true;
+}
+
+/** Whole seconds until the key's window resets — the `Retry-After` value. */
+function authBucketRetryAfterSeconds(
+  ip: string | null,
+  now: number = Date.now(),
+): number {
+  const entry = sessionRouteAttempts.get(ip ?? "unknown");
+  if (!entry || now > entry.resetAt) {
+    return Math.ceil(AUTH_ATTEMPT_WINDOW_MS / 1000);
+  }
+  return Math.max(1, Math.ceil((entry.resetAt - now) / 1000));
+}
+
+function sendRateLimited(
+  res: http.ServerResponse,
+  retryAfterSeconds: number,
+): boolean {
+  if (!res.headersSent) {
+    res.setHeader("retry-after", String(retryAfterSeconds));
+  }
+  sendJsonErrorResponse(res, 429, "Too many requests");
   return true;
 }
 
@@ -197,21 +247,24 @@ export async function handleAuthSessionRoutes(
   }
   const store = new AuthStore(db);
   const ip = req.socket.remoteAddress ?? null;
+  // Rate-limit BUCKET KEY only — audit rows and session metadata keep the
+  // socket address; the key must never feed a trust decision.
+  const limiterKey = resolveRateLimitClientKey(req);
   const userAgent = extractHeaderValue(req.headers["user-agent"]);
 
   // POST /api/auth/setup — first-run owner identity creation
   if (method === "POST" && url.pathname === "/api/auth/setup") {
-    return handleSetup(req, res, store, { ip, userAgent });
+    return handleSetup(req, res, store, { ip, limiterKey, userAgent });
   }
 
   // POST /api/auth/login/password
   if (method === "POST" && url.pathname === "/api/auth/login/password") {
-    return handleLoginPassword(req, res, store, { ip, userAgent });
+    return handleLoginPassword(req, res, store, { ip, limiterKey, userAgent });
   }
 
   // POST /api/auth/password/change
   if (method === "POST" && url.pathname === "/api/auth/password/change") {
-    return handleChangePassword(req, res, store, { ip, userAgent });
+    return handleChangePassword(req, res, store, { ip, limiterKey, userAgent });
   }
 
   // POST /api/auth/logout
@@ -250,11 +303,14 @@ async function handleSetup(
   req: http.IncomingMessage,
   res: http.ServerResponse,
   store: AuthStore,
-  meta: { ip: string | null; userAgent: string | null },
+  meta: {
+    ip: string | null;
+    limiterKey: string | null;
+    userAgent: string | null;
+  },
 ): Promise<boolean> {
-  if (!consumeAuthBucket(meta.ip)) {
-    sendJsonErrorResponse(res, 429, "Too many requests");
-    return true;
+  if (!consumeAuthBucket(meta.limiterKey)) {
+    return sendRateLimited(res, authBucketRetryAfterSeconds(meta.limiterKey));
   }
 
   if (await store.hasOwnerIdentity()) {
@@ -342,11 +398,18 @@ async function handleLoginPassword(
   req: http.IncomingMessage,
   res: http.ServerResponse,
   store: AuthStore,
-  meta: { ip: string | null; userAgent: string | null },
+  meta: {
+    ip: string | null;
+    limiterKey: string | null;
+    userAgent: string | null;
+  },
 ): Promise<boolean> {
-  if (!consumeAuthBucket(meta.ip)) {
-    sendJsonErrorResponse(res, 429, "Too many requests");
-    return true;
+  // Pre-check (not validate-first): password verification is deliberately
+  // expensive, so the limiter must gate it — but only FAILED logins below
+  // consume the bucket, and with real-client keying another client's failures
+  // cannot fill this client's window.
+  if (isAuthBucketLimited(meta.limiterKey)) {
+    return sendRateLimited(res, authBucketRetryAfterSeconds(meta.limiterKey));
   }
   const body = await readCompatJsonBody(req, res);
   if (body == null) return true;
@@ -355,6 +418,7 @@ async function handleLoginPassword(
   const password = typeof body.password === "string" ? body.password : "";
   const rememberDevice = body.rememberDevice === true;
   if (!isValidDisplayName(displayName) || password.length === 0) {
+    recordAuthBucketFailure(meta.limiterKey);
     await appendAuditEvent(
       {
         actorIdentityId: null,
@@ -372,6 +436,7 @@ async function handleLoginPassword(
 
   const identity = await store.findIdentityByDisplayName(displayName);
   if (!identity?.passwordHash) {
+    recordAuthBucketFailure(meta.limiterKey);
     await appendAuditEvent(
       {
         actorIdentityId: identity?.id ?? null,
@@ -394,6 +459,7 @@ async function handleLoginPassword(
     ok = false;
   }
   if (!ok) {
+    recordAuthBucketFailure(meta.limiterKey);
     await appendAuditEvent(
       {
         actorIdentityId: identity.id,
@@ -559,11 +625,17 @@ async function handleChangePassword(
   req: http.IncomingMessage,
   res: http.ServerResponse,
   store: AuthStore,
-  meta: { ip: string | null; userAgent: string | null },
+  meta: {
+    ip: string | null;
+    limiterKey: string | null;
+    userAgent: string | null;
+  },
 ): Promise<boolean> {
-  if (!passwordChangeLimiter.consume(meta.ip)) {
-    sendJsonErrorResponse(res, 429, "Too many requests");
-    return true;
+  if (!passwordChangeLimiter.consume(meta.limiterKey)) {
+    return sendRateLimited(
+      res,
+      passwordChangeLimiter.retryAfterSeconds(meta.limiterKey),
+    );
   }
 
   const body = await readCompatJsonBody(req, res);

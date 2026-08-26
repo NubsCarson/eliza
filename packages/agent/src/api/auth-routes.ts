@@ -19,6 +19,7 @@ import {
   isCloudProvisionedContainer,
   PostAuthPairRequestSchema,
   resolveApiToken,
+  resolveRateLimitClientKey,
 } from "@elizaos/shared";
 import {
   isAuthorized,
@@ -37,6 +38,8 @@ export interface AuthRouteContext extends RouteRequestContext {
   ensurePairingCode: () => string | null;
   normalizePairingCode: (code: string) => string;
   rateLimitPairing: (ip: string | null) => boolean;
+  /** Seconds until the key's pairing window resets, for `Retry-After` 429s. */
+  pairingRetryAfterSeconds?: (ip: string | null) => number;
   getPairingExpiresAt: () => number;
   clearPairing: () => void;
 }
@@ -56,6 +59,7 @@ export async function handleAuthRoutes(
     ensurePairingCode,
     normalizePairingCode,
     rateLimitPairing,
+    pairingRetryAfterSeconds,
     getPairingExpiresAt,
     clearPairing,
   } = ctx;
@@ -196,7 +200,19 @@ export async function handleAuthRoutes(
       error(res, "Pairing disabled", 403);
       return true;
     }
-    if (!rateLimitPairing(req.socket.remoteAddress ?? null)) {
+    // The limiter is deliberately checked BEFORE the code comparison — for
+    // this low-entropy rotating code the pre-check is what bounds online
+    // guessing (W1-038 below). The bucket is keyed on the real client behind
+    // a trusted proxy (`resolveRateLimitClientKey`, rate-limit keying only —
+    // never trust), so noisy strangers sharing a local proxy's socket address
+    // no longer exhaust a legitimate device's pairing window.
+    const pairLimiterKey =
+      resolveRateLimitClientKey(req) ?? req.socket.remoteAddress ?? null;
+    if (!rateLimitPairing(pairLimiterKey)) {
+      const retryAfter = pairingRetryAfterSeconds?.(pairLimiterKey);
+      if (retryAfter !== undefined && !res.headersSent) {
+        res.setHeader("retry-after", String(retryAfter));
+      }
       error(res, "Too many attempts. Try again later.", 429);
       return true;
     }

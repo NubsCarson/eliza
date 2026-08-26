@@ -17,6 +17,7 @@ import {
   isTrustedLocalRequest,
   type LoopbackTrustOptions,
   proxyClientHeaderBlocksLocalTrust,
+  resolveRateLimitClientKey,
 } from "./loopback-trust.js";
 
 /**
@@ -517,5 +518,121 @@ describe("cloudCheck semantics differ between consumers", () => {
     const req = makeReq({ headers: { host: "localhost:2138" } });
     expect(isTrustedLocalRequest(req, APP_CORE_OPTIONS)).toBe(false);
     expect(isTrustedLocalRequest(req, AGENT_OPTIONS)).toBe(true);
+  });
+});
+
+describe("resolveRateLimitClientKey (rate-limit bucket keying, never trust)", () => {
+  const env = (overrides: Record<string, string | undefined> = {}) => ({
+    ...overrides,
+  });
+
+  it("returns the socket peer for a direct remote client, ignoring spoofed XFF", () => {
+    const req = makeReq({
+      ip: "203.0.113.5",
+      headers: { "x-forwarded-for": "10.9.9.9" },
+    });
+    expect(resolveRateLimitClientKey(req, env())).toBe("203.0.113.5");
+  });
+
+  it("returns the loopback peer when no X-Forwarded-For is present", () => {
+    const req = makeReq({ ip: "127.0.0.1" });
+    expect(resolveRateLimitClientKey(req, env())).toBe("127.0.0.1");
+  });
+
+  it("keys on the rightmost XFF entry behind an implicit loopback proxy", () => {
+    const req = makeReq({
+      ip: "127.0.0.1",
+      headers: { "x-forwarded-for": "10.9.9.9, 203.0.113.7" },
+    });
+    expect(resolveRateLimitClientKey(req, env())).toBe("203.0.113.7");
+  });
+
+  it("normalizes host:port and bracketed IPv6 rightmost entries", () => {
+    expect(
+      resolveRateLimitClientKey(
+        makeReq({
+          ip: "::1",
+          headers: { "x-forwarded-for": "203.0.113.7:443" },
+        }),
+        env(),
+      ),
+    ).toBe("203.0.113.7");
+    expect(
+      resolveRateLimitClientKey(
+        makeReq({
+          ip: "127.0.0.1",
+          headers: { "x-forwarded-for": "[2001:db8::1]:8443" },
+        }),
+        env(),
+      ),
+    ).toBe("2001:db8::1");
+  });
+
+  it("uses the last physical header line's last entry for repeated XFF headers", () => {
+    const req = makeReq({ ip: "127.0.0.1" });
+    req.headers["x-forwarded-for"] = [
+      "10.0.0.1",
+      "10.0.0.2, 203.0.113.9",
+    ] as unknown as string;
+    expect(resolveRateLimitClientKey(req, env())).toBe("203.0.113.9");
+  });
+
+  it("falls back to the proxy peer for unparseable or neutral XFF entries", () => {
+    for (const value of ["not-an-ip", "unknown", "_hidden", ""]) {
+      const req = makeReq({
+        ip: "127.0.0.1",
+        headers: { "x-forwarded-for": value },
+      });
+      expect(resolveRateLimitClientKey(req, env())).toBe("127.0.0.1");
+    }
+  });
+
+  it("does not treat loopback as a proxy when ELIZA_REQUIRE_LOCAL_AUTH=1", () => {
+    const req = makeReq({
+      ip: "127.0.0.1",
+      headers: { "x-forwarded-for": "203.0.113.7" },
+    });
+    expect(
+      resolveRateLimitClientKey(req, env({ ELIZA_REQUIRE_LOCAL_AUTH: "1" })),
+    ).toBe("127.0.0.1");
+  });
+
+  it("honours an explicit ELIZA_TRUSTED_PROXY_ADDRS even under require-local-auth", () => {
+    const req = makeReq({
+      ip: "127.0.0.1",
+      headers: { "x-forwarded-for": "203.0.113.7" },
+    });
+    expect(
+      resolveRateLimitClientKey(
+        req,
+        env({
+          ELIZA_REQUIRE_LOCAL_AUTH: "1",
+          ELIZA_TRUSTED_PROXY_ADDRS: "127.0.0.1",
+        }),
+      ),
+    ).toBe("203.0.113.7");
+  });
+
+  it("honours a non-loopback CIDR proxy list and rejects peers outside it", () => {
+    const inside = makeReq({
+      ip: "10.1.2.3",
+      headers: { "x-forwarded-for": "203.0.113.8" },
+    });
+    const outside = makeReq({
+      ip: "192.168.1.9",
+      headers: { "x-forwarded-for": "203.0.113.8" },
+    });
+    const proxyEnv = env({ ELIZA_TRUSTED_PROXY_ADDRS: "10.0.0.0/8" });
+    expect(resolveRateLimitClientKey(inside, proxyEnv)).toBe("203.0.113.8");
+    expect(resolveRateLimitClientKey(outside, proxyEnv)).toBe("192.168.1.9");
+  });
+
+  it("returns null when no peer address can be established", () => {
+    const req = makeReq({});
+    Object.defineProperty(req.socket, "remoteAddress", {
+      value: undefined,
+      configurable: true,
+    });
+    expect(resolveRateLimitClientKey(req, env())).toBeNull();
   });
 });

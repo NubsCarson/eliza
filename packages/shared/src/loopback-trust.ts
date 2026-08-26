@@ -306,6 +306,70 @@ export function isRemoteAddressInCidrList(
   }
 }
 
+/**
+ * Rate-limit bucket key for the requesting client, proxy-aware.
+ *
+ * Per-IP rate limiters that key on `socket.remoteAddress` collapse to a single
+ * shared bucket when the listener sits behind a local reverse proxy (Traefik,
+ * nginx): every remote client arrives from the proxy's address, so one noisy
+ * unauthenticated client (health checks, scanners) exhausts the bucket for
+ * everyone — including clients whose auth would succeed. This helper returns
+ * the address the bucket should be keyed on instead:
+ *
+ *  - When the TCP peer is a TRUSTED PROXY — a loopback peer (unless
+ *    `ELIZA_REQUIRE_LOCAL_AUTH === "1"`, where loopback is explicitly not a
+ *    trust signal because the interface is shared with every app on the
+ *    device), or a peer inside the operator's `ELIZA_TRUSTED_PROXY_ADDRS`
+ *    CIDR list — the key is the RIGHTMOST `X-Forwarded-For` entry, i.e. the
+ *    one appended by that proxy from its own socket-observed peer address,
+ *    which the proxied client cannot forge.
+ *  - Otherwise (no trusted proxy, or no parseable XFF entry) the key is the
+ *    socket peer address itself — byte-identical to the previous behavior.
+ *
+ * SECURITY INVARIANT — keying only, never trust: the returned value must be
+ * used exclusively to partition rate-limit buckets. It must never feed a
+ * trust or authorization decision ({@link isTrustedLocalRequest} continues to
+ * treat any proxy client-IP header as trust-BLOCKING, see
+ * {@link proxyClientHeaderBlocksLocalTrust}).
+ *
+ * Spoofing analysis: behind a well-behaved trusted proxy the rightmost XFF
+ * entry is appended by the proxy from the connection it accepted, so a client
+ * cannot choose its own key — spoofed XFF values sit further left and are
+ * ignored. If an attacker CAN control the rightmost entry (a misconfigured
+ * proxy that forwards client XFF verbatim, or a process on a trusted-proxy
+ * address talking to the listener directly), rotating it merely FRAGMENTS the
+ * attacker's own failed-attempt buckets: the failed-auth throttle degrades
+ * toward pre-limiter behavior for that attacker alone. A spoofed key never
+ * joins another client's successful-auth path (buckets only ever deny, and
+ * successful auth neither consults nor increments them), never elevates
+ * trust, and never weakens credential checks themselves.
+ */
+export function resolveRateLimitClientKey(
+  req: Pick<http.IncomingMessage, "headers"> & {
+    socket?: Pick<http.IncomingMessage["socket"], "remoteAddress"> | null;
+  },
+  env: Record<string, string | undefined> = process.env,
+): string | null {
+  const peer = req.socket?.remoteAddress ?? null;
+  if (!peer) return null;
+
+  const trustedProxyPeer =
+    isRemoteAddressInCidrList(peer, env.ELIZA_TRUSTED_PROXY_ADDRS) ||
+    (isLoopbackRemoteAddress(peer) && env.ELIZA_REQUIRE_LOCAL_AUTH !== "1");
+  if (!trustedProxyPeer) return peer;
+
+  // Node folds repeated `x-forwarded-for` lines into one comma-joined string;
+  // exotic transports may surface an array — take the last physical header
+  // line, then its last comma-separated entry: the proxy-appended one.
+  const values = headerValues(req.headers["x-forwarded-for"]);
+  const lastValue = values.length > 0 ? values[values.length - 1] : null;
+  if (!lastValue) return peer;
+  const entries = lastValue.split(",");
+  const rightmost = entries[entries.length - 1] ?? "";
+  if (isNeutralProxyClientAddress(rightmost)) return peer;
+  return normalizeProxyClientIp(rightmost) ?? peer;
+}
+
 const LOCAL_APP_PROTOCOLS = new Set([
   "file:",
   "app:",

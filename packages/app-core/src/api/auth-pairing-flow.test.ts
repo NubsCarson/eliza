@@ -54,6 +54,7 @@ interface Harness {
 interface HttpResult {
   status: number;
   json: Record<string, unknown> | null;
+  retryAfter: string | null;
 }
 
 /**
@@ -68,6 +69,8 @@ async function request(
     method: string;
     path: string;
     proxied?: boolean;
+    /** Explicit X-Forwarded-For value (wins over `proxied`'s default). */
+    forwardedFor?: string;
     bearer?: string;
     body?: unknown;
   },
@@ -80,7 +83,8 @@ async function request(
     headers["content-type"] = "application/json";
     headers["content-length"] = String(Buffer.byteLength(payload));
   }
-  if (opts.proxied) headers["x-forwarded-for"] = REMOTE_IP;
+  if (opts.forwardedFor) headers["x-forwarded-for"] = opts.forwardedFor;
+  else if (opts.proxied) headers["x-forwarded-for"] = REMOTE_IP;
   if (opts.bearer) headers.authorization = `Bearer ${opts.bearer}`;
 
   return await new Promise<HttpResult>((resolve, reject) => {
@@ -105,7 +109,12 @@ async function request(
               json = null;
             }
           }
-          resolve({ status: res.statusCode ?? 0, json });
+          resolve({
+            status: res.statusCode ?? 0,
+            json,
+            retryAfter:
+              (res.headers["retry-after"] as string | undefined) ?? null,
+          });
         });
       },
     );
@@ -369,6 +378,62 @@ describe("production device-pairing auth path — real DB + real HTTP (#13692)",
     }
     expect(statuses.slice(0, 5)).toEqual([403, 403, 403, 403, 403]);
     expect(statuses[5]).toBe(429);
+  });
+
+  it("answers throttled pairing attempts with a Retry-After header", async () => {
+    await fetchPairCode();
+    let last: HttpResult | null = null;
+    for (let i = 0; i < 6; i += 1) {
+      last = await request(harness.baseUrl, {
+        method: "POST",
+        path: "/api/auth/pair",
+        body: { code: "ZZZZ-ZZZZ-ZZZZ" },
+      });
+    }
+    expect(last?.status).toBe(429);
+    const retryAfter = Number(last?.retryAfter);
+    expect(Number.isFinite(retryAfter)).toBe(true);
+    expect(retryAfter).toBeGreaterThanOrEqual(1);
+    expect(retryAfter).toBeLessThanOrEqual(600);
+  });
+
+  it("keys pairing buckets per XFF client behind the loopback proxy and never throttles a correct code", async () => {
+    const code = await fetchPairCode();
+    const clientA = "203.0.113.201";
+    const clientB = "203.0.113.202";
+
+    // Client A burns its whole window with wrong codes.
+    const aStatuses: number[] = [];
+    for (let i = 0; i < 6; i += 1) {
+      const res = await request(harness.baseUrl, {
+        method: "POST",
+        path: "/api/auth/pair",
+        forwardedFor: clientA,
+        body: { code: "ZZZZ-ZZZZ-ZZZZ" },
+      });
+      aStatuses.push(res.status);
+    }
+    expect(aStatuses[5]).toBe(429);
+
+    // Client B, behind the SAME proxy socket, has an untouched bucket.
+    const bWrong = await request(harness.baseUrl, {
+      method: "POST",
+      path: "/api/auth/pair",
+      forwardedFor: clientB,
+      body: { code: "YYYY-YYYY-YYYY" },
+    });
+    expect(bWrong.status).toBe(403);
+
+    // And a CORRECT code from the exhausted client A still pairs — only
+    // failed attempts consult the bucket (ordering half of the fix).
+    const aCorrect = await request(harness.baseUrl, {
+      method: "POST",
+      path: "/api/auth/pair",
+      forwardedFor: clientA,
+      body: { code },
+    });
+    expect(aCorrect.status).toBe(200);
+    expect(typeof aCorrect.json?.token).toBe("string");
   });
 
   it("goes dark when pairing is disabled", async () => {
