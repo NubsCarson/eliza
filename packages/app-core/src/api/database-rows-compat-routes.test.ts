@@ -80,6 +80,11 @@ vi.mock("@elizaos/shared", () => ({
   quoteIdent: (value: string) => `"${String(value).replace(/"/g, '""')}"`,
   resolveApiToken: (env: NodeJS.ProcessEnv) =>
     env.ELIZA_API_TOKEN?.trim() || null,
+  // Socket-passthrough stand-in for the proxy-aware limiter key (real
+  // behavior is covered by the shared loopback-trust suite).
+  resolveRateLimitClientKey: (req: {
+    socket?: { remoteAddress?: string | null } | null;
+  }) => req.socket?.remoteAddress ?? null,
   sanitizeIdentifier: (value: string | null | undefined) => {
     if (value == null) return null;
     const trimmed = String(value).trim();

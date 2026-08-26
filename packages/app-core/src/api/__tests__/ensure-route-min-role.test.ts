@@ -53,6 +53,11 @@ vi.mock("@elizaos/core", async (importOriginal) => {
 vi.mock("@elizaos/shared", () => ({
   resolveApiToken: (env: NodeJS.ProcessEnv) =>
     env.ELIZA_API_TOKEN?.trim() || null,
+  // Socket-passthrough stand-in for the proxy-aware limiter key (real
+  // behavior is covered by the shared loopback-trust suite).
+  resolveRateLimitClientKey: (req: {
+    socket?: { remoteAddress?: string | null } | null;
+  }) => req.socket?.remoteAddress ?? null,
 }));
 
 vi.mock("../auth/sessions.js", () => ({
