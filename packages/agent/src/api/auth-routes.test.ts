@@ -49,6 +49,12 @@ vi.mock("./server-helpers-auth.ts", () => ({
 vi.mock("@elizaos/shared", () => ({
   isCloudProvisionedContainer: vi.fn(() => false),
   resolveApiToken: vi.fn(() => null),
+  // Real keying behavior is covered by the shared loopback-trust suite and
+  // auth-routes-pair.test.ts; here the socket peer IS the key (no proxy).
+  resolveRateLimitClientKey: vi.fn(
+    (req: { socket?: { remoteAddress?: string | null } | null }) =>
+      req.socket?.remoteAddress ?? null,
+  ),
   PostAuthPairRequestSchema: {
     safeParse: vi.fn(() => ({ success: true, data: { code: "ABCDEFGH" } })),
   },
