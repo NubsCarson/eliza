@@ -2173,6 +2173,7 @@ export function answerlessToolTurnReport(args: {
 	actionResults: readonly ActionResult[];
 	actions: readonly Action[] | undefined;
 	stageOneAck: string;
+	prePatchStageOneReply?: string;
 }): string {
 	const successful = preservedSettledToolResult(
 		args.settledToolResults,
@@ -2200,7 +2201,20 @@ export function answerlessToolTurnReport(args: {
 	const effectConfirmation = structuredEffectConfirmation(
 		args.settledToolResults,
 	);
-	if (effectConfirmation) return effectConfirmation;
+	if (effectConfirmation) {
+		const naturalStageOneReply = args.prePatchStageOneReply?.trim() ?? "";
+		const naturalReplyEgress = naturalStageOneReply
+			? evaluatePlannedReplyEgress({
+					reply: naturalStageOneReply,
+					actionResults: [],
+					actions: args.actions ?? [],
+				})
+			: undefined;
+		if (naturalStageOneReply && naturalReplyEgress?.verdict === "allow") {
+			return naturalStageOneReply;
+		}
+		return effectConfirmation;
+	}
 	return NO_REPORTABLE_TOOL_OUTCOME_MESSAGE;
 }
 
@@ -10754,6 +10768,7 @@ export async function runV5MessageRuntimeStage1(args: {
 								actionResults,
 								actions: args.runtime.actions,
 								stageOneAck,
+								prePatchStageOneReply,
 							})
 						: "")
 				: preservedAnswerFallback;
