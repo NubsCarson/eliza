@@ -1439,11 +1439,13 @@ describe("v5 happy path — message handler → planner → executor → evaluat
 
 	// tj-a835d4c6da235f: a deterministic VIEWS navigation succeeded with an
 	// internal-visibility JSON effect receipt and the turn still closed with
-	// the no-result apology. The answerless floor must synthesize the honest
-	// confirmation from the accepted effect's label — no model call.
+	// the no-result apology. The answerless floor must preserve safe natural
+	// Stage 1 prose after the accepted effect proves the navigation occurred.
 	const runDeterministicViewsTurn = async (
 		handlerResult: ActionResult,
+		options: { stageOneReply?: string } = {},
 	): Promise<string | undefined> => {
+		const stageOneReply = options.stageOneReply ?? "Heading there now.";
 		const views = makeMockAction({
 			name: "VIEWS",
 			parameters: [
@@ -1487,7 +1489,7 @@ describe("v5 happy path — message handler → planner → executor → evaluat
 					body: stage1Response({
 						contexts: ["general"],
 						candidateActionNames: ["VIEWS"],
-						replyText: "Heading there now.",
+						replyText: stageOneReply,
 						thought: "The view switch is deterministic.",
 					}),
 				},
@@ -1508,7 +1510,7 @@ describe("v5 happy path — message handler → planner → executor → evaluat
 			: undefined;
 	};
 
-	it("confirms a deterministic VIEWS success from its accepted effect receipt instead of the no-result apology", async () => {
+	it("preserves natural Stage 1 prose after a deterministic VIEWS success receipt", async () => {
 		const text = await runDeterministicViewsTurn({
 			success: true,
 			text: JSON.stringify({
@@ -1521,23 +1523,64 @@ describe("v5 happy path — message handler → planner → executor → evaluat
 			transcriptVisibility: "internal",
 			modelReplyRequired: true,
 		});
-		expect(text).toBe("done — you're on Home.");
+		expect(text).toBe("Heading there now.");
 	});
 
-	it("keeps the effect confirmation through reply egress when the view label collides with a tracked-work noun", async () => {
-		const text = await runDeterministicViewsTurn({
-			success: true,
-			text: JSON.stringify({
-				effect: "view_navigation",
-				status: "accepted",
-				viewId: "settings",
-				label: "Settings",
-				path: "/settings",
-			}),
-			transcriptVisibility: "internal",
-			modelReplyRequired: true,
-		});
-		expect(text).toBe("done — you're on Settings.");
+	it("preserves safe Stage 1 prose when the view label collides with a tracked-work noun", async () => {
+		const text = await runDeterministicViewsTurn(
+			{
+				success: true,
+				text: JSON.stringify({
+					effect: "view_navigation",
+					status: "accepted",
+					viewId: "settings",
+					label: "Settings",
+					path: "/settings",
+				}),
+				transcriptVisibility: "internal",
+				modelReplyRequired: true,
+			},
+			{ stageOneReply: "You're in Settings now." },
+		);
+		expect(text).toBe("You're in Settings now.");
+	});
+
+	it("does not release an unsafe Stage 1 mutation claim for an accepted view receipt", async () => {
+		const text = await runDeterministicViewsTurn(
+			{
+				success: true,
+				text: JSON.stringify({
+					effect: "view_navigation",
+					status: "accepted",
+					viewId: "notes",
+					label: "Notes",
+					path: "/notes",
+				}),
+				transcriptVisibility: "internal",
+				modelReplyRequired: true,
+			},
+			{ stageOneReply: "Done — I saved your note and opened Notes." },
+		);
+		expect(text).toBe("done — you're on Notes.");
+	});
+
+	it("keeps the accepted-effect fallback when Stage 1 supplied no prose", async () => {
+		const text = await runDeterministicViewsTurn(
+			{
+				success: true,
+				text: JSON.stringify({
+					effect: "view_navigation",
+					status: "accepted",
+					viewId: "notes",
+					label: "Notes",
+					path: "/notes",
+				}),
+				transcriptVisibility: "internal",
+				modelReplyRequired: true,
+			},
+			{ stageOneReply: "" },
+		);
+		expect(text).toBe("done — you're on Notes.");
 	});
 
 	it("keeps the no-result fallback for a deterministic success with no receipt at all", async () => {
