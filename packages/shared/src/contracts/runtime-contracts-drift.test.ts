@@ -231,7 +231,12 @@ describe("runtime and shared public literals", () => {
 
   it("keeps role unions exhaustive for role-resolution consumers", () => {
     const roleNames = ["OWNER", "ADMIN", "USER", "GUEST"] as const;
-    const roleGrantSources = ["owner", "manual", "connector_admin"] as const;
+    const roleGrantSources = [
+      "owner",
+      "manual",
+      "connector_admin",
+      "session",
+    ] as const;
 
     expectTypeOf<RoleName>().toEqualTypeOf<(typeof roleNames)[number]>();
     expectTypeOf<RoleGrantSource>().toEqualTypeOf<
