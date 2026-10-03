@@ -721,13 +721,7 @@ export function readLadderRungTitle(
 }
 
 export function buildReminderBody(args: {
-  timezone?: string;
   title: string;
-  scheduledFor: string;
-  dueAt: string | null;
-  channel: LifeOpsReminderStep["channel"];
-  lifecycle: ReminderAttemptLifecycle;
-  nearbyReminderTitles?: string[];
   derivedTarget?: Record<string, unknown> | null;
 }): string {
   // Timing and delivery identity remain on the saved occurrence and receipts.
@@ -1663,11 +1657,6 @@ export class RemindersDomain {
     const reminderFocusTitle = rungTitle ?? args.title;
     const fallback = buildReminderBody({
       title: args.title,
-      scheduledFor: args.scheduledFor,
-      dueAt: args.dueAt,
-      channel: args.channel,
-      lifecycle: args.lifecycle,
-      nearbyReminderTitles: args.nearbyReminderTitles,
       derivedTarget: args.derivedTarget,
     });
     if (typeof this.ctx.runtime.useModel !== "function") {
@@ -4628,9 +4617,8 @@ export class RemindersDomain {
         args.bodyOverride === undefined;
       reminderBody = exactReminder
         ? buildReminderBody({
-            ...args,
-            dueAt: args.snoozedUntil ?? args.dueAt,
-            lifecycle,
+            title: args.title,
+            derivedTarget: args.derivedTarget,
           })
         : (args.bodyOverride ??
           (await this.renderReminderBody({
@@ -4648,7 +4636,7 @@ export class RemindersDomain {
         presentation = createReminderPresentation(
           reminderBody,
           reminderBody,
-          reminderBody,
+          "Reminder",
         );
       if (args.channel === "in_app") {
         connectorRef = "system:in_app";
