@@ -202,7 +202,30 @@ export function formatNextEventContextForUser(
           month: "short",
           day: "numeric",
         } as const;
-        return `No upcoming event was found in ${sources} from ${formatCalendarDatePart(start, zone, date)} to before ${formatCalendarDatePart(end, zone, date)}.`;
+        const bounds = [start, end].map((bound) => {
+          const parts = getZonedDateParts(bound, zone);
+          const milliseconds = bound.getMilliseconds();
+          const midnight =
+            parts.hour % 24 === 0 &&
+            parts.minute === 0 &&
+            parts.second === 0 &&
+            milliseconds === 0;
+          return formatCalendarDatePart(bound, zone, {
+            ...date,
+            ...(!midnight
+              ? {
+                  hour: "numeric",
+                  minute: "2-digit",
+                  ...(parts.second || milliseconds
+                    ? { second: "2-digit" }
+                    : {}),
+                  ...(milliseconds ? { fractionalSecondDigits: 3 } : {}),
+                  timeZoneName: "short",
+                }
+              : {}),
+          });
+        });
+        return `No upcoming event was found in ${sources} from ${bounds[0]} to before ${bounds[1]}.`;
       }
       return `No upcoming event was found in ${sources} within the checked dates.`;
     }
