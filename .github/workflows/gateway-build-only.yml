@@ -1,0 +1,98 @@
+name: Pinned Linux gateway build proof
+
+on:
+  push:
+    branches: [codex/gateway-linux-proof-20261010]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pinned-gateway-build-proof
+  cancel-in-progress: false
+
+jobs:
+  build-only:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      SOURCE_SHA: de6d09902cd1c6959e6fff02af6a9c804335ab0b
+      DOCKERFILE: packages/cloud/services/gateway-webhook/Dockerfile
+      IMAGE_TAG: gateway-proof:de6d09902cd1
+      BASE_TAG: oven/bun:1.4.2-alpine
+    steps:
+      # Check out only the public source. Do not check out or enable its workflows.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: elizaOS/eliza
+          ref: de6d09902cd1c6959e6fff02af6a9c804335ab0b
+          path: source
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Verify immutable source and record build inputs
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ../proof
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          grep -Fx 'ARG BUN_BASE=oven/bun:1.4.2-alpine' "$DOCKERFILE"
+          test -f .dockerignore
+          docker version > ../proof/docker-version.txt
+          docker pull --platform linux/amd64 "$BASE_TAG" > ../proof/base-pull.log 2>&1
+          docker image inspect "$BASE_TAG" > ../proof/base-image.json
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib
+          p=pathlib.Path('../proof')
+          base=json.loads((p/'base-image.json').read_text())[0]
+          assert base['Os']=='linux' and base['Architecture']=='amd64'
+          files=[os.environ['DOCKERFILE'],'.dockerignore','.github/ci-bun-version.json']
+          inputs={f:hashlib.sha256(pathlib.Path(f).read_bytes()).hexdigest() for f in files}
+          receipt={'sourceRepository':'elizaOS/eliza','sourceSha':os.environ['SOURCE_SHA'],
+            'platform':'linux/amd64','dockerfile':os.environ['DOCKERFILE'],
+            'inputSha256':inputs,'defaultBunBase':os.environ['BASE_TAG'],
+            'baseImageId':base['Id'],'baseRepoDigests':base.get('RepoDigests',[]),
+            'operation':'build-only; no push, container start, providers or deployment'}
+          (p/'input-receipt.json').write_text(json.dumps(receipt,indent=2)+'\n')
+          PY
+      - name: Build gateway from repository root without credentials
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Default Dockerfile arguments only. No secret mounts, SSH, registry login or build credentials.
+          docker build --platform linux/amd64 --progress=plain --iidfile ../proof/image-id.txt \
+            -f "$DOCKERFILE" -t "$IMAGE_TAG" . > ../proof/build.log 2>&1
+      - name: Record built image metadata without starting a container
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker image inspect "$IMAGE_TAG" > ../proof/built-image.json
+          python3 - <<'PY'
+          import hashlib,json,pathlib
+          p=pathlib.Path('../proof')
+          base=json.loads((p/'base-image.json').read_text())[0]
+          image=json.loads((p/'built-image.json').read_text())[0]
+          assert image['Os']=='linux' and image['Architecture']=='amd64'
+          assert image['Config']['User']=='gateway'
+          layers=base['RootFS']['Layers']
+          assert image['RootFS']['Layers'][:len(layers)]==layers
+          receipt=json.loads((p/'input-receipt.json').read_text())
+          receipt.update({'buildSucceeded':True,'imageId':image['Id'],'imageSizeBytes':image['Size'],
+            'imageOs':image['Os'],'imageArchitecture':image['Architecture'],
+            'imageUser':image['Config']['User'],'imageCmd':image['Config']['Cmd'],
+            'baseLayersVerified':True,'buildLogSha256':hashlib.sha256((p/'build.log').read_bytes()).hexdigest(),
+            'runtimeAcceptance':'not tested; no container started','publishedImage':False})
+          (p/'build-receipt.json').write_text(json.dumps(receipt,indent=2)+'\n')
+          print(json.dumps(receipt,indent=2))
+          PY
+      - name: Retain build receipt and logs, including a failed build
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: gateway-linux-amd64-de6d09902cd1
+          path: proof/
+          if-no-files-found: error
+          retention-days: 7
