@@ -17,16 +17,16 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
-      SOURCE_SHA: de6d09902cd1c6959e6fff02af6a9c804335ab0b
+      SOURCE_SHA: 0b2fb39dca24c359105b69efecb0c50705befb3c
       DOCKERFILE: packages/cloud/services/gateway-webhook/Dockerfile
-      IMAGE_TAG: gateway-proof:de6d09902cd1
+      IMAGE_TAG: gateway-proof:0b2fb39dca24
       BASE_TAG: oven/bun:1.4.2-alpine
     steps:
       # Check out only the public source. Do not check out or enable its workflows.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: elizaOS/eliza
-          ref: de6d09902cd1c6959e6fff02af6a9c804335ab0b
+          ref: 0b2fb39dca24c359105b69efecb0c50705befb3c
           path: source
           persist-credentials: false
           fetch-depth: 1
@@ -92,7 +92,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: gateway-linux-amd64-de6d09902cd1
+          name: gateway-linux-amd64-0b2fb39dca24
           path: proof/
           if-no-files-found: error
           retention-days: 7
